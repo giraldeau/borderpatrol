@@ -1,0 +1,176 @@
+#!/usr/bin/perl
+
+use Data::Dumper;
+use strict;
+
+my %pf2rid;
+my %p2rid;
+my %ridstart;
+my $rid = 0;
+my $cur_rid = -1;
+
+my (@R, @P, @S);
+
+my $s = 0;
+
+######################################################################
+
+my @lines = map { s/[\r\n]//g; $_ } <STDIN>;
+
+# create a data struture, keyed on PID
+my $dat;
+for (@lines) {
+  my ($v,$pid,$seq,$prog,$syscall) = split /\|/;
+  push @{$dat->{$pid}->{actions}},
+   { pid => $pid, ts => $seq+0, name => $prog, line => $syscall, full => $_ };
+}
+
+# sort each process
+for my $pid (keys %{$dat}) {
+  $dat->{$pid}->{actions} = [ sort { $a->{ts} <=> $b->{ts} }
+			      @{$dat->{$pid}->{actions}} ];
+}
+
+
+# $VAR1 = {
+#           '5599' => {
+#                       'actions' => [
+#                                      {
+#                                        'pid' => '5599',
+#                                        'ts' => '0000320423',
+#                                        'name' => '(null)',
+#                                        'line' => 'fork() = 0'
+#                                      },
+
+######################################################################
+
+# define connection initiation
+
+my %pCloser;
+
+for my $pid (keys %{$dat}) {
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    if ($act->{line} =~ /^(\d+)=accept/ and $1 > 0) {
+      $act->{rid} = ++$rid;
+      $pCloser{$pid} = $1;
+      $ridstart{$rid} = $act->{ts};
+    }
+  }
+}
+
+# spread rid's down past accepts (until close(fd))
+
+for my $pid (keys %{$dat}) {
+  my $crid = undef;
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    $crid = $act->{rid} if $act->{rid};
+    $act->{rid} = $crid if $crid and not $act->{rid} and $act->{line} !~ /^close\((\d+)\)/;
+    if ($act->{line} =~ /^close\((\d+)\)/ and $pCloser{$pid} == $1) {
+      $crid = undef;
+    }
+  }
+}
+
+# spread rid's across fork()
+
+my %pid2rid;
+my %forkline;
+for my $pid (keys %{$dat}) {
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    if ($act->{rid} and $act->{line} =~ /^fork\(\) = (\d+)/ and $1 > 0) {
+      $pid2rid{$1} = $act->{rid};
+      $forkline{$1} = { start => $act->{ts}, ppid => $pid, pid => $1, rid => $act->{rid} };
+    }
+  }
+}
+for my $pid (keys %{$dat}) {
+  next unless $pid2rid{$pid};
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    $act->{rid} ||= $pid2rid{$pid} if $act->{ts} >= $ridstart{$pid2rid{$pid}};
+  }
+}
+for my $pid (keys %{$dat}) {
+  next unless $forkline{$pid};
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    if($act->{line} =~ /^fork\(\) = 0/) {
+      printf "fk|%d|%d|%d|%d|%d\n",
+      @{$forkline{$pid}}{qw/rid ppid start pid/}, $act->{ts};
+    }
+  }
+}
+
+######################################################################
+
+# convert data structure to actions { pid => [ {start,end,rid,txt,flag} ] }
+
+for my $pid (keys %{$dat}) {
+  my ($cur_rid,$start,$end) = (undef,-1,-1);
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    if ($act->{rid} and not $cur_rid) {
+      ($cur_rid,$start) = @{$act}{qw/rid ts/};
+    }
+    # stop rid
+    elsif (not $act->{rid} and $cur_rid) {
+      printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+        $pid, $cur_rid, $start, $act->{ts}, "processingS", $act->{name}, 0;
+      $cur_rid = undef;
+      $start = -1;
+    }
+    # switch rids
+    elsif ($act->{rid} != $cur_rid) {
+      printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+        $pid, $cur_rid, $start, $act->{ts}, "processingW", $act->{name}, 0;
+      $cur_rid = $act->{rid};
+      $start = $act->{ts};
+    }
+    # same rid, but started to read/write
+    elsif ($act->{rid} and $act->{line} =~ /(read|write|send|recv)_begin\(/) {
+      # stop current
+      printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+        $pid, $cur_rid, $start, $act->{ts}, "processingS", $act->{name}, 0;
+      $start = $act->{ts};
+    }
+    elsif ($act->{rid} and $act->{line} =~ /(read|write|send|recv)\(/) {
+      # finish read/write
+      printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+        $pid, $cur_rid, $start, $act->{ts}, "$1", $act->{name}, 0;
+      $start = $act->{ts};
+    }
+    elsif ($act->{rid} and $act->{line} =~ /poll_begin\(/) {
+      # finish read/write
+      printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+        $pid, $cur_rid, $start, $act->{ts}, "processingP", $act->{name}, 0;
+      $start = $act->{ts};
+      # TODO : disassociate with RID
+    }
+    elsif ($act->{rid} and $act->{line} =~ /virtual.*poll\(/) {
+      # finish read/write
+      printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+        $pid, -1, $start, $act->{ts}, "poll", $act->{name}, 0;
+      $start = $act->{ts};
+      # TODO : reassociate with RID
+    }
+  }
+  # ran off the end
+  if ($cur_rid) {
+    my $act = $dat->{$pid}->{actions}->[$#{$dat->{$pid}->{actions}}];
+    printf "rq|%d|%d|%d|%d|%s|%s|%d\n",
+      $pid, $act->{rid}, $start, $act->{ts}, "processingE", $act->{name}, 0;
+  }
+}
+
+######################################################################
+
+# old output
+
+__DATA__
+for my $pid (sort keys %{$dat}) {
+  for my $act (@{$dat->{$pid}->{actions}}) {
+    next unless $act->{rid};
+    
+
+    printf "%s => $act->{full}\n", ($act->{rid} ? "[$act->{rid}]" : "   ");
+  }
+}
+
+######################################################################

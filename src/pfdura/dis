@@ -1,0 +1,1 @@
+objdump -S -r -D -I ~/Download/linux-source-2.6.27/mm ~/Download/linux-source-2.6.27/mm/memory.o > filemap.dis

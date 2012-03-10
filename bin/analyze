@@ -1,0 +1,91 @@
+#!/usr/bin/perl
+#* ************************************************************** *
+#* File : analyze
+#* Desc : run agg, import, transform, vis
+#* Auth : Eric Koskinen
+#* Date : Wed Jan 24 14:56:40 2007
+#* RCS  : $Id: analyze,v 1.7 2009-03-31 22:02:07 ning Exp $
+#* ************************************************************** *
+
+use Data::Dumper;
+use strict;
+use Cwd 'abs_path';
+use File::Basename;
+
+my $PREFIX = dirname(dirname(abs_path($0)));
+
+##################################################################
+
+my %args = (
+  agg => 1,
+  import => 1,
+  transform => 1,
+  queries => 1,
+);
+
+for (@ARGV) {
+  $args{$1} = (defined $2 and $2 ne '' ? $2 : 1)
+    if /^--?([a-z]+)=?(.*)$/;
+}
+
+print Dumper(\%args);
+
+sub stage {
+  my ($stage,$fn) = @_;
+  if (not $args{$stage}) {
+    print "--- $_[0] ... SKIPPED!\n";
+  } else {
+    print "+++ $_[0] ...\n";
+    &{$fn};
+  }
+}
+
+my ($RAW) = grep(/^[^-]/, @ARGV)
+  or die "usage: analyze x.raw\n";
+
+(my $EDB = $RAW) =~ s/\.raw/.edb/;
+(my $WDB = $RAW) =~ s/\.raw/.wdb/;
+
+##################################################################
+
+# -------------------------------------------
+stage("agg", sub {
+	system("/bin/rm", "/tmp/bp.msg");
+	print "agg $RAW $EDB $WDB\n";
+	system("../src/agg/agg", $RAW, $EDB, $WDB,
+	       $PREFIX . "/src/agg/") == 0 or die $!;
+});
+
+
+# -------------------------------------------
+stage("import", sub {
+	print "name: $EDB, $WDB\n";
+	open IN, "$PREFIX/etc/debug-schema.sql" or die $!;
+	open OUT, ">/tmp/debug-schema.sql" or die $!;
+	while(<IN>) {
+	  s/EDB_FILE/$EDB/g;
+	  s/WDB_FILE/$WDB/g;
+	  print OUT $_;
+	}
+	close IN;
+	close OUT;
+	system(qw{psql debug --file /tmp/debug-schema.sql}) == 0 or die $!;
+	#system('psql', 'debug', '--command',
+	#"\"SELECT * FROM dgn WHERE rid > 0 ORDER BY ts LIMIT 5\"") == 0 or die $!;
+	#system('psql', 'debug', '--command',
+	#"'SELECT * FROM ev ORDER BY ts DESC LIMIT 5'") == 0 or die $!;
+});
+
+# -------------------------------------------
+stage("queries", sub {
+	system('psql', 'debug', '--file', "$PREFIX/src/agg/queries.sql") == 0 or die $!;
+});
+
+# -------------------------------------------
+stage("transform", sub {
+	system('psql', 'debug', '--file', "$PREFIX/src/vis/build-ranges.sql") == 0 or die $!;
+});
+
+# print "--- requests\n";
+
+##################################################################

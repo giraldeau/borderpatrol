@@ -1,0 +1,313 @@
+
+				BorderPatrol
+
+				version 0.4
+
+
+WHAT IS BORDERPATROL
+
+	BorderPatrol is a system which obtains precise request traces through
+	systems containing multiple binary modules. Modules of the traced system
+	can reside on different machines. BorderPatrol obtains traces by
+	observing system calls and messages passed between modules. A central
+	log daemon collects all the traces from each individual traced
+	module. BorderPatrol determines the paths through the
+	system modules for each request by processing the collected logs.
+
+	With BorderPatrol, developers can ask questions like "What path through
+	the system do search requests take, and where do they spend the most
+	time?" or "What resources are used by clients reading email, as compared
+	to sending email?".
+
+
+REQUIREMENTS
+
+	Older versions of the packages listed below might work as
+	well. These versions were tested, however. These versions are
+	included with Fedora 10 Linux.
+
+	* gcc 4.3.2
+	* make 3.81
+	* ocaml 3.10.2 (aggregator)
+	* swig 1.3.35 (aggregator)
+	* ocaml-postgresql-devel 1.8.2 (aggregator)
+	* postgresql-server 8.3.7 (aggregator)
+	* postgresql-python 8.3.7
+	* linux kernel 2.6 or above (pagefault)
+	* kernel-devel (pagefault)
+
+
+COMPILATION
+
+	Type 'make' in the top directory of the BorderPatrol project.
+        This creates
+
+          libbtrace.so: The shared library that allows unmodified
+          programs to emit tracing events.
+
+          logd: The user level program that collects trace events.
+          One logd is run to collect events for any number of traced
+          modules on multiple machines.
+
+          pfmon: Optional user level program to add page faults to the
+          event graph. Only useful in combination with the page fault
+          monitoring kernel module.
+
+
+PAGEFAULT MONIOTOR MODULE
+
+	To compile the pagefault handler, you need the kernel
+	development package for the currently running kernel
+	version. Once the package is installed, type 'make' in the
+	src/pfdura subdirectory to make the kernel module. A file
+	called pfdura-mod.ko will be generated. To enable the kernel
+	module, use the following command as root in the src/pfdura
+	subdirectory,
+
+	$ insmod pfdura-mod.ko
+
+	If all go well, there should be no output and you are taken back to the
+	command prompt immediately.
+
+        If you have problems, remember that border patrol is happy to
+        produce causal traces without pagefaults.
+
+
+DATABASE
+
+	A small tool, aggregator, insert events from a raw
+	log file (as collected by logd) into a PostgreSQL database
+	(support for other databases is welcome welcome).
+
+	The following commands are, for Fedora 10 Linux, prepare the
+	database for aggregator's use.
+
+	Initialize the database and start up the server as root:
+
+	$ /sbin/service postgresql initdb
+	$ /sbin/service postgresql start
+
+	Create the user and database that we will use for the
+	aggregator. Replace all occurrances of $USER in the following
+	commands with the username that you will be using to run the aggregator.
+
+	$ sudo su -l postgres
+	$ createuser --no-superuser --no-createdb --no-createrole $USER
+	$ createdb --owner $USER debug
+
+	Set up the permissions for the database we just created.
+
+	$ psql debug
+	debug=> GRANT ALL ON DATABASE debug TO public;
+	debug=> \q
+
+
+ENVIRONMENT VARIABLES
+
+	LIBBTRACE_PATH: This is the absolute path to libbtrace.so.. If
+	unset, the default path is lib/libbtrace.so in the installation path
+	(ex. /usr/local/lib/libbtrace.so if you installed it under /usr/local).
+
+	LIBBTRACE_HOST: The host name of the machine which runs
+	logd. It can either be the hostname or the IP address of
+	that machine.
+
+	LIBBTRACE_PORT: The port number of the log daemon. If unset, the default
+	is 7070.
+
+	LIBBTRACE_SERVICES: The absolute path to the service-port mapping
+	file. This file specifies which port maps to which service (ex. port 80
+	to http). The format of this file is the same as that of
+	/etc/services. If unset, the default is /etc/services. If set,
+	the user specified mappings override the mappings in
+	/etc/services which are read as defaults.
+
+
+EXECUTION
+
+	The log daemon must be started before tracing. To start the
+	log daemon, run the logd executable file in src/logd
+	subdirectory with two command-line arguments, the port
+	number and the log filename, ex.
+
+	$ ./logd 7070 test.raw
+
+	Once the log daemon is running, you can start tracing programs on
+	different machines. All the tracing events will be logged to the file
+	you specified. In the example above, events will be logged to test.raw.
+
+	To start tracing a program on the same machine as the log
+	daemon, prefix your run of the target program with
+	"LD_PRELOAD=/path/to/libbtrace.so" without the double quotes:
+
+	$ LD_PRELOAD=/usr/local/lib/libbtrace.so ls -a
+
+	If you want to trace a program on a machine different from the machine
+	which the log daemon runs on, you need to set the LIBBTRACE_HOST and
+	LIBBTRACE_PORT (optional if using the default port number 7070)
+	environment variables first:
+
+	$ export LIBBTRACE_HOST=192.168.0.1 (if you are using bash)
+	or
+	$ set LIBBTRACE_HOST=192.168.0.1 (if you are using csh)
+
+	$ LD_PRELOAD=/usr/local/lib/libbtrace.so ls -a (for bash)
+	or
+	$ (set LD_PRELOAD=/usr/local/lib/libbtrace.so; ls -a) (for csh)
+
+        BorderPatrol works by understanding several common protocols,
+        such as HTTP and DNS. If one of the services you are are
+        tracing uses a non-standard port number, you need to create a
+        service-port mapping file with the custom mapping. Consult
+        /etc/services for the format of the file. Once the file
+	is created, set the LIBBTRACE_SERVICES environment variable to point to
+	the file before you start tracing.
+
+	Once the traced programs terminate properly, you can shutdown the log
+	daemon by pressing Ctrl-c.
+
+
+ENABLING PAGEFAULT HANDLER
+
+	The pagefault handler is not enabled by default. In order to monitor
+	pagefaults, you first need to insert the kernel module as described in
+	section INSTALLATION OF PAGEFAULT HANDLER, then you have to mount the
+	kernel debugging filesystem to /mnt/relay (create this directory if it
+	does not exist) by running the following command as root:
+
+	$ mount -t debugfs debugfs /mnt/relay
+
+	Once the debugging file system is mounted, you can start the pagefault
+	monitor program by executing the pfmon program in src/trace/
+	subdirectory. To shutdown the pagefault monitoring program, simple press
+	Ctrl-C.
+
+
+ANALYSIS
+
+	There is a small tool "expand" in src/logd subdirectory which
+	prints the raw log messages in a log file. Run it with the log
+	filename as the argument to confirm operation.
+
+	The fields in the log message are seperated by the vertical bar "|". The
+	following is a description of the fields,
+
+	thread_ID|process_ID|tv_sec,tv_usec|system_call_type|return_value|arguments,string argument
+
+	The creation of the causal paths is done by the analyzer. Before running
+	the analyzer, make sure that the LIBBTRACE_SERVICES environment variable
+	is set if you have special port assignments which are not specified in
+	/etc/services. To do this, simply run the analyze executable file in
+	bin/ subdirectory followed by the absolute path to the log file. The
+	result will be stored in the "debug" database.
+
+	After the analyzer has finished analyzing the data, you can use
+	print_requests.py and print_paths.py in bin/ subdirectory to print out
+	the requests and the corresponding paths for each request,
+	respectively. The generated output of these two programs is formatted in
+	HTML, so you can redirect the output into a file and view them in the
+	browser. (contributions to the path and the request printers for better
+	user-interfaces are highly welcome)
+
+
+EXAMPLE
+
+	Here is a full example of tracing and analyzing a series of web
+	requests. The system in this example consists of several modules, namely
+	Apache 1.3, a CGI script, and PostgreSQL 8.3.7 database server. The
+	Apache web server runs on machine A with IP address 192.168.0.1. The CGI
+	script runs on the same machine whereas the database runs on a different
+	machine B with IP address 192.168.0.2.
+
+	Since we want to trace the page faults of the modules in the system, we
+	will insert the page fault handler module into the kernels on both of
+	the machines. Do the following in the src/pfdura/ sub-directory on both
+	of them, as root:
+
+	$ insmod pfdura-mod.ko
+	$ mkdir /mnt/relay
+	$ mount -t debugfs debugfs /mnt/relay
+
+	Before starting to trace these modules, we have to set the environment
+	variables first. Since we are using port 8080 for the Apache web server,
+	which is different from the normal port 80, we need to specify this in
+	our own service-port mapping file which is located at
+	/etc/myservices. The file contains the following content,
+
+	www 8080/tcp http
+
+	Now we need to set the environment variables on each meachine using
+	Bash. We will run the log daemon on machine B. So for machine A, the
+	following environment variables have to be set,
+
+	$ export LIBBTRACE_HOST=192.168.0.2
+	$ export LIBBTRACE_SERVICES=/etc/myservices
+
+	Since the database uses the normal port number 5432, there is no need to
+	specify this in our custom service-port mapping file. And we do not have
+	to set LIBBTRACE_HOST since the log daemon runs on the same machine.
+
+	We can start the log daemon by executing the following command in the
+	src/logd sub-directory,
+
+	$ ./logd 7070 /tmp/log.raw
+
+	The log daemon now listens on port 7070 on machine B and all log
+	messages will be written to file /tmp/log.raw.
+
+	Once the log daemon has started running, all tracing applications can be
+	launched. We have to start the page fault monitor on both machines so
+	that page fault messages can be sent to the log daemon. Execute the
+	following command in the src/trace/ sub-directory,
+
+	$ ./pfmon
+
+	We will start by launching the database server as root on machine B.
+
+	$ LD_PRELOAD=/usr/local/lib/libbtrace.so \
+	  /etc/init.d/postgresql start
+
+	Then on machine A, we can start the Apache web server:
+
+	$ LD_PRELOAD=/usr/local/lib/libbtrace.so \
+	  /usr/local/apache/bin/apachectl start
+
+	Please make sure that you run your traced program in the same shell
+	where you have set the environment variables, otherwise the environment
+	variables will not be set.
+
+	At this point, the whole system is running and being
+	traced. We can make a request to the CGI script from a third
+	machine. After making the request and getting the results back
+	from the server, we can shutdown all the modules. (NOTICE:
+	Since your programs are constantly communicating with logd,
+	shut them down before stopping the log daemon.  Else they will
+	block.)
+
+	On machine A, we shutdown the Apache web server by running
+
+	$ /usr/local/apache/bin/apachectl stop
+
+	Similarly, we shutdown the database server on machine B
+
+	$ /etc/init.d/postgresql stop
+
+	After all the modules have been shutdown cleanly, we terminate the log
+	daemon by pressing Ctrl-C in the same shell as we ran it.
+
+	Now all we have the raw log file which contains all the log messages
+	sent from both machines in log.raw. We can analyze the log file by
+	running the analyzer from the bin/ sub-directory.  (Remember
+	that ./analyze requires a prepared PostgreSQL database that it
+	will populate.)
+
+	$ ./analyze /tmp/log.raw
+
+	The print_paths.py script will show the causal paths for all
+	the requests.
+
+	$ ./print_paths.py > /tmp/paths.html
+
+	In the resulting HTML file, the first number at the beginning of each
+	line is the request ID. All the bold lines show the switching of
+	processes in a single request.

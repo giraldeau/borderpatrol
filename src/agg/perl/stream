@@ -1,0 +1,645 @@
+#!/usr/bin/perl -w
+#
+# $Id: stream,v 1.1 2006-11-30 18:59:33 ejk Exp $
+#
+# Script to parse the log file and construct a trace tree
+#
+
+use lib '/research/instance/active/src/lib';
+
+use Visualize::Requests;
+
+use Storable qw/dclone/;
+use Data::Dumper;
+use strict;
+
+my $NULLREQ = -1;
+
+##############################################################################
+
+# what are the requests that we treat as first class
+
+my %isFCreq = ( https => 1 );
+
+my %vpids;
+my $lastVPID = 5;
+
+sub tid_get_parents {
+  my ($vpid) = @_;
+  my %vpid_r = reverse %vpids;
+  my $pidtid = $vpid_r{$vpid};
+  die "no pidtid for $vpid: $pidtid\n".Dumper(\%vpid_r) unless $pidtid;
+  (my $pid = $pidtid) =~ s/^.*(\d{6})$/$1/;
+  # find all other keys that end in $pid
+  #print "VPID: $vpid PT: $vpid_r{$vpid} PID: $pid\n";
+  return unless my @parents = grep { /(\d{6})$/ and $1 == $pid } keys %vpids;
+  #print "PARENTS: ".join(',',@parents)."\n";
+  return grep { not $_ == $vpid } map { $vpids{$_} } @parents;
+}
+
+sub pid2firstvpid {
+  my ($pid) = @_;
+  # get all the keys that have $pid
+  my @keys = grep { /$pid$/ } keys %vpids;
+
+  # return the one with the lowest value (first to be forked)
+  my @skeys = sort { $vpids{$a} <=> $vpids{$b} } @keys;
+
+  my $out = $skeys[0];
+
+  #warn "pid2firstvpid: $pid -> $out -> $vpids{$out}\n";
+  return $vpids{$out};
+}
+
+sub getvpid {
+  my($tid,$pid) = @_;
+  #return pid2firstvpid($pid) if $tid == 0 or $tid == $pid;
+  die "strange tid=$tid pid = $pid" if $tid == 0;# or $tid == $pid;
+  my $pidtid = sprintf("%lu%06d",$tid,$pid);
+  my $vpid = ($vpids{$pidtid} ? $vpids{$pidtid} : ($vpids{$pidtid} = ++$lastVPID));
+  return $vpid;
+}
+
+sub getrealpid {
+  my ($vpid) = @_;
+  my %vpid_r = reverse %vpids;
+  my $pidtid = $vpid_r{$vpid};
+  $pidtid =~ m/^(.*)(\d{6})$/;
+  return [$1,$2];
+}
+
+##############################################################################
+
+# preprocessor
+
+my %pid2nm = ();
+my $pidfd2type;
+
+my @acts;
+while (<STDIN>) {
+  chomp;
+  next unless /^(\d+)\|(\d+)\|([\d\.]+)\|([^\|]+)\|(.*)$/;
+  my $vpid = getvpid($1,$2);
+  my ($ts,$nm,$ev) = ($3,$4,$5);
+  $ts =~ s/^\d{4}(\d+)\./$1/;
+  $nm =~ s/[\(\)]//g;
+  $nm =~ s/null/\?/g;
+  $pid2nm{$vpid} = $nm;
+  push @acts, { pid => $vpid, ts => $ts, nm => $nm, ev => $ev }
+}
+
+##############################################################################
+
+# rendezvous
+
+my %rdv;
+my %rdv_sid;
+
+my $tree;
+my @leaves;
+my $lastReqId = 1;
+my $poutput = '';
+
+my @TUPPLE = ();    # (pid,fd,reqid) keeps trace of which
+my @SOCKETS = ();   # (sockid,pid,fd,rid)
+my $lastSockId = 0;
+
+my %disk_resume;
+my %new_req_alert;
+
+my %args = (
+  dumpdisk => 0,
+  dumpevents => 0,
+  dumptupple => 0,
+  dumpgraph => 0,
+  dumpreqinit => 0,
+  requests => 0,
+  lalign => 1,
+  table => '/tmp/dump.table',
+  minlen => 5,
+);
+
+for (@ARGV) {
+  $args{$1} = (defined $2 and $2 ne '' ? $2 : 1)
+    if /^--?([a-z]+)=?(.*)$/;
+}
+#print Dumper(\%args);
+
+$Data::Dumper::Indent = 0;
+
+sub clean_port {
+  my ($port) = @_;
+  $port =~ s/[\[\]]//g;
+  # HACK!
+  $port =~ s/PGSQL.*$/PGSQL/;
+  #$port = "localhost:" if $port =~ /\//;
+  $port = "localhost_$port";
+  return $port;
+}
+
+##############################################################################
+
+if($args{-help}) {
+  print <<EOT;
+
+ usage: stream [options]
+
+  -help => 0
+  -dumpdisk => 0,
+  -dumpevents => 0,
+  -dumptupple => 0,
+  -dumpgraph => 0,
+  -dumpreqinit => 0,
+  -table => '/tmp/dump.table',
+  -show
+
+  -requests => 1
+  -lalign => 1
+  -labelsome
+  -labelall
+  -rid
+
+EOT
+}
+
+##############################################################################
+
+# visualization
+
+my ($vrdata,$vrmin,$vrmax);
+my ($billing);
+my $crap;
+
+sub vr_end {
+  my($act,$status,$rid,$pid) = @_;
+  my $ts = $act->{ts};
+
+  # turn off open range
+  if($vrdata->{$rid}->{pids}->{$pid}->{ranges}) {
+    for my $range (@{$vrdata->{$rid}->{pids}->{$pid}->{ranges}}) {
+      if(not $range->{end}) {
+	$range->{end} = $ts;
+	push @{$range->{events}}, $act;
+      }
+    }
+  }
+}
+
+##############################################################################
+
+# visualization
+
+sub vr_is_now {
+  my($act,$status) = @_;
+  my ($ts,$pid) = @{$act}{qw/ts pid/};
+  my $rid = $status->{$act->{pid}}->{rid};
+  my $note = $status->{$act->{pid}}->{note};
+
+  $vrdata->{$rid}->{lastts} = $ts;
+  $vrmax = $ts;
+  $vrmin = $ts if not defined $vrmin;
+  # if working for other rids, stop and record stop event
+  for my $orid (grep($_!=$rid,keys %{$vrdata})) {
+    next unless $vrdata->{$orid}->{pids}->{$pid};
+    for my $range (@{$vrdata->{$orid}->{pids}->{$pid}->{ranges}}) {
+      if(not $range->{end}) {
+	$range->{end} = $ts;
+	push @{$range->{events}}, $act;
+      }
+    }
+  }
+
+  # have i been assigned to this rid?
+  if($vrdata->{$rid}->{pids}->{$pid}) {
+    # do i have an open range?
+    my $need_new_range = 1;
+    for my $range (@{$vrdata->{$rid}->{pids}->{$pid}->{ranges}}) {
+      if(not $range->{end}) {
+	push @{$range->{events}}, $act;
+	$range->{note} = $note if $note;
+	$need_new_range = 0;
+      }
+    }
+    # need a new range
+    if($need_new_range) {
+      push @{$vrdata->{$rid}->{pids}->{$pid}->{ranges}},
+        { begin => $ts, events => [ $act ], note => $note };
+    }
+  # first assignment
+  } else {
+    $vrdata->{$rid}->{pids}->{$pid}->{realpid} = getrealpid($pid);
+    $vrdata->{$rid}->{pids}->{$pid}->{ranges} =
+      [ { begin => $ts, events => [ $act ], note => $note } ];
+    $vrdata->{$rid}->{firstts} = $ts;
+  }
+
+}
+
+##############################################################################
+
+# unix domain SUCKets
+
+my ($last);
+
+for my $act (sort {$a->{ts}cmp$b->{ts}} @acts) {
+  if($act->{ev} =~ /^0=connect\(\d+\) \[(.+),\]$/) {
+    my $k = $1;
+    $last->{conn}->{$k} = (defined $last->{conn}->{$k} ? ++$last->{conn}->{$k} : 1);
+    print "lc1: $last->{conn}->{$k}\n";
+    $act->{ev} =~ s/,\]/,$last->{conn}->{$k}\]/;
+  }
+  elsif($act->{ev} =~ /^\d+accept=\(\d+\) \[(.+),\]$/) {
+    my $k = $1;
+    $last->{acpt}->{$k} = (defined $last->{acpt}->{$k} ? ++$last->{acpt}->{$k} : 1);
+    $act->{ev} =~ s/,\]/,$last->{acpt}->{$k}\]/;
+  }
+}
+
+#print Dumper($last)."\n";
+#exit;
+
+##############################################################################
+
+# add_tuple: add a new row to the tupple, make sure never rid inconsistency
+
+sub add_tuple {
+  my ($new) = @_;
+
+  my @stripped = grep { not($_->{pid} == $new->{pid} and
+			    $_->{fd}  == $new->{fd}) } @TUPPLE;
+
+  #warn "removed dupe\n" if $#stripped != $#TUPPLE;
+  @TUPPLE = (@stripped, $new);
+}
+
+sub search_tuple {
+  my (%args) = @_;
+
+  my @res = grep { (defined $args{pid} ? ($_->{pid} == $args{pid}) : 1) &&
+		   (defined $args{fd}  ? ($_->{fd}  == $args{fd} ) : 1) &&
+		   (defined $args{rid} ? ($_->{rid} == $args{rid}) : 1) } @TUPPLE;
+
+  #die "search failed => ".Dumper(\%args,\@res,\@TUPPLE)."\n" unless @res;
+  return @res;
+}
+
+sub remove_tuple {
+  my (%args) = @_;
+
+  my @sliced = grep { not((defined $args{pid} ? ($_->{pid} == $args{pid}) : 1) &&
+		          (defined $args{fd}  ? ($_->{fd}  == $args{fd} ) : 1) &&
+			  (defined $args{rid} ? ($_->{rid} == $args{rid}) : 1)) } @TUPPLE;
+
+  my $ret = not ($#sliced == $#TUPPLE);
+  @TUPPLE = @sliced;
+  return $ret;
+}
+
+##############################################################################
+
+my $last_ts;
+my $status = { 1 => {rid => $NULLREQ}}; # replaces %active %active_d %ondisk
+
+warn sprintf "stream: $all events to process ...\n", scalar @acts;
+
+my $ctr=0;
+for my $act (sort {$a->{ts}cmp$b->{ts}} @acts) {
+  warn sprintf("$ctr / %d\n") if ((++$ctr) % 10000 == 0);
+  # ignore these
+  next if $act->{ev} =~ /real.*poll/;
+  $crap = $act;
+
+  my $strev;
+  #next if $args{dumpevents};
+
+  ########### fork ###########
+  # process forked
+  if($act->{ev} =~ /^(\d+)=fork\(\)$/ and $1 > 0) {
+    my $vpid = pid2firstvpid($1);
+    # take on work of parent
+    $status->{$vpid}->{rid} = $status->{$act->{pid}}->{rid};
+
+    my @dupes = search_tuple(pid=>$act->{pid});
+    for(@dupes) {
+      my $n = dclone($_); $n->{pid} = $vpid;
+      add_tuple($n);
+    }
+    # take on pipes/forks
+    if (scalar keys %{$pidfd2type->{$act->{pid}}}) {
+      $pidfd2type->{$vpid}->{$_} = $pidfd2type->{$act->{pid}}->{$_}
+        for keys %{$pidfd2type->{$act->{pid}}};
+    }
+    $strev = "fork-$vpid";
+    # take on sockets
+    my @new;
+    for my $s (@SOCKETS) {
+      next unless $s->{pid} == $act->{pid};
+      my $n = dclone($s); $n->{pid} = $vpid; push @new, $n;
+    }
+    push @SOCKETS, @new;
+  }
+
+  ########### exist ###########
+  # new process appears (not from a fork)
+  if(not defined $status->{$act->{pid}}) {
+    $strev = "appear";
+    if (my @parents = tid_get_parents($act->{pid})) {
+      my ($job) = (map { ($status->{$_}->{rid}) }
+	           grep { $status->{$_}->{rid} } @parents);
+      if($job and $job >= 0) {
+	# inherit
+	$status->{$act->{pid}}->{rid} = $job;
+	$strev = "appearJ$job";
+      }
+      for my $p (@parents) {
+	print "parent: $p\n";
+	my @matches = search_tuple(pid=>$p);
+	for (@matches) {
+	  my $n = dclone($_);
+	  $n->{pid} = $act->{pid};
+	  add_tuple($n);
+	}
+      }
+      $status->{$act->{pid}}->{rid} ||= $NULLREQ;
+    # no parents, really a new guy
+    } else {
+      add_tuple({pid=>$act->{pid},fd=>0,rid=>$NULLREQ});
+      add_tuple({pid=>$act->{pid},fd=>1,rid=>$NULLREQ});
+      add_tuple({pid=>$act->{pid},fd=>2,rid=>$NULLREQ});
+      $status->{$act->{pid}}->{rid} = $NULLREQ;
+    }
+  }
+
+  die "not currently working on any request! $status->{$act->{pid}}->{rid}"
+    unless $status->{$act->{pid}}->{rid} == $NULLREQ or
+           $status->{$act->{pid}}->{rid} > 0;
+
+  ########### events ###########
+  if($act->{ev} =~ /poll_begin/) {
+    $status->{$act->{pid}}->{rid} = $NULLREQ;
+
+  } elsif($act->{ev} =~ /\](\d+)=poll\(nfds=.+,tm=.+\)( {fd=(\d+)})?/) {
+    if($1 > 0) {
+      $strev = "poll-$3";
+      # look up (pid=,fd=,req=?)
+      my @rows = search_tuple(pid=>$act->{pid},fd=>$3);
+      die "too many fd rows".Dumper(\@rows) if scalar @rows > 1;
+      die "unknown fd"       if scalar @rows < 1;
+      $status->{$act->{pid}}->{rid} = $rows[0]->{rid} if scalar @rows >= 1;
+    } else {
+      # timer interrupt
+      $strev = "poll-T";
+      $status->{$act->{pid}}->{rid} = $NULLREQ;
+    }
+
+  } elsif($act->{ev} =~ /select_begin\((\d+)\) /) { #read=\{(.*)\} write=\{(.*)\}$/) {
+    $status->{$act->{pid}}->{rid} = $NULLREQ;
+
+  } elsif($act->{ev} =~ /^1=select\(.*\) {fd=(\d+)}$/) {
+    $strev = "select-$1";
+    my @rows = search_tuple(pid=>$act->{pid},fd=>$1);
+    die "too many fd rows" if scalar @rows > 1;
+    die "unknown fd: $1".Dumper($act).Dumper(\@TUPPLE)  if scalar @rows < 1;
+    $status->{$act->{pid}}->{rid} = $rows[0]->{rid} unless @rows < 1;
+
+  } elsif($act->{ev} =~ /^(\d+)=socket\(.*\)$/) {
+    $strev = "socket";
+    $pidfd2type->{$act->{pid}}->{$1} = 'socket';
+    add_tuple({pid=>$act->{pid},fd=>$1,rid=>$status->{$act->{pid}}->{rid}});
+    #push @TUPPLE, { pid => $act->{pid}, fd => $1, rid => $status->{$act->{pid}}->{rid}};
+    push @SOCKETS, { sid => ++$lastSockId, pid => $act->{pid}, fd => $1,
+		     rid => $status->{$act->{pid}}->{rid} };
+
+  } elsif($act->{ev} =~ /^0=pipe\((\d+),(\d+)\)$/) {
+    $strev = "pipe";
+    $pidfd2type->{$act->{pid}}->{$1} = 'pipe';
+    $pidfd2type->{$act->{pid}}->{$2} = 'pipe';
+    add_tuple({pid=>$act->{pid},fd=>$1,rid=>$status->{$act->{pid}}->{rid}});
+    add_tuple({pid=>$act->{pid},fd=>$2,rid=>$status->{$act->{pid}}->{rid}});
+    #push @TUPPLE, { pid => $act->{pid}, fd => $1, rid => $status->{$act->{pid}}->{rid}};
+    #push @TUPPLE, { pid => $act->{pid}, fd => $2, rid => $status->{$act->{pid}}->{rid}};
+    my $sid = ++$lastSockId;
+    push @SOCKETS, { sid => $sid, pid => $act->{pid}, fd => $1,
+		     rid => $status->{$act->{pid}}->{rid} };
+    push @SOCKETS, { sid => $sid, pid => $act->{pid}, fd => $2,
+		     rid => $status->{$act->{pid}}->{rid} };
+
+  } elsif($act->{ev} =~ /^(\d+)=dup2?\((\d+)[^\d]/ and $1 >= 0) {
+    $strev = "dup";
+    my ($newfd,$oldfd) = ($1,$2);
+    my @dupes = search_tuple(pid=>$act->{pid},fd=>$oldfd);
+    die "too many fd rows" if scalar @dupes > 1;
+    die "unknown fd $2"    if scalar @dupes < 1;
+    for(@dupes) {
+      my $n = dclone($_); $n->{fd} = $newfd;
+      add_tuple($n);
+    }
+    $pidfd2type->{$act->{pid}}->{$newfd} = $pidfd2type->{$act->{pid}}->{$oldfd};
+    #warn "dup: $act->{ev} ($pidfd2type->{$act->{pid}}->{$newfd})\n";
+    my @new;
+    for my $s (@SOCKETS) {
+      next unless $s->{fd} == $oldfd and $s->{pid} == $act->{pid};
+      my $n = dclone($s); $n->{fd} = $newfd; push @new, $n;
+    }
+    push @SOCKETS, @new;
+
+#  14|825380.071403|thttpd|0=dup2(7,0)
+
+
+  } elsif($act->{ev} =~ /^close\((\d+)\)$/) {
+    $strev = "close";
+    $strev = "closeT" if remove_tuple(pid=>$act->{pid},fd=>$1);
+    # check if i'm no longer serving the active request
+    my @closed = search_tuple(pid=>$act->{pid},fd=>$1,rid=>$status->{$act->{pid}}->{rid});
+    if(scalar @closed) {
+      $status->{$act->{pid}}->{rid} = $NULLREQ;
+    }
+    @SOCKETS = grep { not ( $_->{fd} == $1 and $_->{pid} == $act->{pid} ) } @SOCKETS;
+
+  } elsif($act->{ev} =~ /^exit\(/) {
+    $strev = "exit";
+    $strev = "exitT" if remove_tuple(pid=>$act->{pid});
+    $status->{$act->{pid}}->{rid} = $NULLREQ;
+
+  } elsif($act->{ev} =~ /^abort\(/) {
+    $strev = "abort";
+    $strev = "abortT" if remove_tuple(pid=>$act->{pid});
+    $status->{$act->{pid}}->{rid} = $NULLREQ;
+
+  } elsif($act->{ev} eq 'shutdown') {
+    $strev = "shutdown";
+    $strev = "shutdownT" if remove_tuple(pid=>$act->{pid});
+    $status->{$act->{pid}}->{rid} = $NULLREQ;
+
+  ########### requestlets ###########
+  } elsif($act->{ev} =~ /^req_begin\(([^,]+),(\d+),(\d+)\)/ and $isFCreq{$1}) {
+    $strev = "pp-$1-$2-beg$3";
+    print "REQ!: $strev\n";
+    $disk_resume{$act->{pid}} = $status->{$act->{pid}}->{rid} = $lastReqId++;
+    $new_req_alert{$act->{pid}} = 1;
+    add_tuple({pid=>$act->{pid},fd=>$2,rid=>$status->{$act->{pid}}->{rid}});
+
+  } elsif($act->{ev} =~ /^req_end\(([^,]+),(\d+),(\d+)\)$/ and $isFCreq{$1}) {
+    $strev = "pp-$1-$2-end$3";
+    $status->{$act->{pid}}->{rid} = $NULLREQ;
+    add_tuple({pid=>$act->{pid},fd=>$2,rid=>$NULLREQ});
+
+  ########### accept ###########
+  } elsif($act->{ev} =~ /^(\d+)=accept\((\d+)\) \[(.*)\]$/) {
+    my $was = $status->{$act->{pid}}->{rid};
+    $pidfd2type->{$act->{pid}}->{$1} = 'socket';
+    unless ($rdv{$3}) {
+      warn "unable to rendezvous against [$3] ".Dumper(\%rdv)."\n";
+      add_tuple({pid=>$act->{pid},fd=>$1,rid=>$was});
+    } else {
+      my $now = $status->{$act->{pid}}->{rid} = $rdv{$3};
+      $strev = "acceptR";
+      add_tuple({pid=>$act->{pid},fd=>$1,rid=>$now});
+    }
+    warn "rdv: $3 -> $rdv{$3}\n";
+    push @SOCKETS, { pid => $act->{pid}, fd => $1, rid => $rdv{$3}||$NULLREQ, sid => $rdv_sid{$3}||++$lastSockId };
+    #die $!;
+
+  ########### connect ###########
+  } elsif($act->{ev} =~ /^0=connect\((\d+)\) \[(.*)\]$/) {
+    #$status->{$act->{pid}}->{$1} = 'socket';
+    $pidfd2type->{$act->{pid}}->{$1} = 'socket';
+    $rdv{$2} = $status->{$act->{pid}}->{rid};
+    ($rdv_sid{$2}) = map { $_->{sid} } grep { $_->{fd} == $1 and $_->{pid} == $act->{pid} } @SOCKETS;
+    print "RDV: $2 rid=$rdv{$2} rdv_sid=$rdv_sid{$2}\n";
+    $strev = "conn";
+
+  ########### disk ###########
+  } elsif ($act->{ev} =~ /^(\d+)=open\(/) {
+    add_tuple({pid=>$act->{pid},fd=>$1,rid=>$status->{$act->{pid}}->{rid}});
+
+  } elsif ($act->{ev} =~ /^(\d+)=creat\(/) {
+    add_tuple({pid=>$act->{pid},fd=>$1,rid=>$status->{$act->{pid}}->{rid}});
+
+  } elsif ($act->{ev} =~ /(read|write|readv|writev|recv|recvfrom|send|sendto)_begin\((\d+),/ or $act->{ev} =~ /(pagefault)_begin()/) {
+    $strev = "$1B";
+    my $fd = $2;
+    $status->{$act->{pid}}->{note} = $pidfd2type->{$act->{pid}}->{$fd} || 'disk';
+    $disk_resume{$act->{pid}} = $status->{$act->{pid}}->{rid};
+    vr_end($act,$status,$status->{$act->{pid}}->{rid},$act->{pid});
+    # insight:
+    add_tuple({pid=>$act->{pid},fd=>$fd,rid=>$status->{$act->{pid}}->{rid}});
+    # if it's a pipe or socket
+    if($fd and $act->{ev} =~ /(write|writev|send|sendto)/) {
+      if (my ($sid) = map { $_->{sid} } grep { $_->{pid} == $act->{pid} and $_->{fd} == $fd } @SOCKETS) {
+	for (@SOCKETS) {
+	  next unless $_->{sid} == $sid;
+	  $_->{rid} = $status->{$act->{pid}}->{rid};
+	  #warn "propagating rid $status->{$act->{pid}}->{rid} to ($_->{sid},$_->{pid},$_->{fd})\n";
+	}
+      }
+    }
+
+  } elsif ($act->{ev} =~ /(read|write|readv|writev|recv|recvfrom|send|sendto)\((\d+)[^\d]/ or $act->{ev} =~ /(pagefault)_end/) {
+    $strev = "$1E";
+    # resume where we left off
+    delete $status->{$act->{pid}}->{note};
+    my $rid = $disk_resume{$act->{pid}};
+    # end this segment so we draw a dot
+    vr_end($act,$status,$status->{$act->{pid}}->{rid},$act->{pid});
+    # consult the socket unless
+    unless ($new_req_alert{$act->{pid}}) {
+      my $fd = $2;
+      if($fd and $act->{ev} =~ /(read|readv|recv|recvfrom)/) {
+	if (my ($irid) = map { $_->{rid} } grep { $_->{pid} == $act->{pid} and $_->{fd} == $fd } @SOCKETS) {
+	  warn "takeover\n";
+	  $rid = $irid;
+	}
+      }
+    }
+    # so after all that, what rid are we on?
+    $status->{$act->{pid}}->{rid} = $rid;
+    delete $disk_resume{$act->{pid}};
+    delete $new_req_alert{$act->{pid}};
+
+  }
+
+  ########### billing ###########
+  if(defined $last_ts) {
+    my $tsdiff = $act->{ts} - $last_ts;
+    for my $pid (keys %{$status}) {
+      next unless my $rid = $status->{$pid}->{rid};
+      $billing->{$rid}->{$pid2nm{$pid}||'?'} += $tsdiff;
+    }
+  }
+
+  vr_is_now($act,$status) if $args{requests};
+  $last_ts = $act->{ts};
+
+  ########### display ###########
+
+  if(scalar keys %{$status}) {
+    my $output = #$act->{ts}.
+    sprintf("[%7s]",$strev||'').join(' ',
+       map(substr($pid2nm{$_}||'?',0,1).
+	   $_.
+	   ($status->{$_}->{rid} != -1 ? "($status->{$_}->{rid})" : '').
+	   (defined $status->{$_}->{disk} ? substr($status->{$_}->{disk},0,1) : ''),
+	   sort keys %{$status}))."\n";
+    print $output unless !$args{dumpgraph} or $output eq $poutput;
+    $poutput = $output;
+  } else {
+    warn "no pids. strange.\n"; # .Dumper($status)."\n";
+  }
+
+  print "EV:".Dumper($act)."\n" if $args{dumpevents};
+  print "TP:".join('     ',map(join(',',@{$_}{qw/pid fd rid/}),@TUPPLE))."\n"
+    if $args{dumptupple};
+  print "SOCKS:".join('     ',map(join(',',@{$_}{qw/sid pid fd rid/}),@SOCKETS))."\n"
+    if $args{dumpsocks};
+
+  print "---------------------\n" if $args{dumpevents} or $args{dumptupple};
+}
+
+
+
+printf "Implicitly ended %d requests\n", scalar grep { $status->{$_}->{rid} } keys %{$status};
+
+##############################################################################
+
+if($args{table}) {
+  open TABLE, ">$args{table}" or die $!;
+  my %bcols = map { ($_ => 1) } map { keys %{$_} } values %{$billing};
+  print TABLE join('|',('rid',keys %bcols,'total'))."\n";
+  for my $rid (sort {$a <=> $b} keys %{$billing}) {
+    my $tot = 0;
+    print TABLE join('|',($rid,map(($tot+=($billing->{$rid}->{$_}||0)) &&
+			     ($billing->{$rid}->{$_}||0),keys %bcols)));
+    print TABLE "|$tot\n";
+  }
+  close TABLE;
+  print "Request table stored in [$args{table}]\n";
+}
+
+$Data::Dumper::Indent = 1;
+
+open F, ">/tmp/fdtype.map" or die $!;
+print F Dumper($pidfd2type);
+close F;
+
+$Data::Dumper::Indent = 1;
+open F, ">/tmp/vpid.map" or die $!;
+print F Dumper(\%vpids);
+close F;
+
+open F, ">/tmp/vpid.map.nm" or die $!;
+print F Dumper(\%pid2nm);
+close F;
+
+##############################################################################
+
+if($args{requests}){
+  my $rv = Visualize::Requests->new(%args);
+  #print Dumper($vrdata);
+  $rv->plot($vrdata,$vrmin,$vrmax,\%pid2nm);
+  #exit;
+  #$rv->render();
+}
+
+
+##############################################################################

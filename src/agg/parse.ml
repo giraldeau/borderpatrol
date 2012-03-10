@@ -267,7 +267,7 @@ let store_event_db ev eid =
 		                                       (nth ev.e_args 0)
 		                                       (nth ev.e_args 1)
 		                                       (nth ev.e_args 2)
-		                                       (Postgresql.escape_string ev.e_str)
+		                                       (conn#escape_string ev.e_str)
       (* . . . . . . . . . . . . . . . . . . . . . . . . . . . *) in
       (*Printf.printf "SQL: %s\n" sql;*)
       let res = (conn#exec sql) in
@@ -283,9 +283,9 @@ let store_event_out ev eid out =
   with
     | Not_found ->
 
-  let str = (Postgresql.escape_string
+  let str = (conn#escape_string
 		(Str.global_replace (Str.regexp "\n") "_NEWLINE_" ev.e_str)) in
-  let str2 = (Postgresql.escape_string
+  let str2 = (conn#escape_string
 		(Str.global_replace (Str.regexp "\r") "_NEWLINER_" str)) in
 
   Printf.fprintf out

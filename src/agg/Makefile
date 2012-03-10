@@ -18,9 +18,9 @@ SWIG=swig
 all: agg
 
 agg: syscalls.ml $(SOURCE) agg.ml swig.cmo bridge.cmo
-	ocamlc -custom $(FLAGS) -o agg $(EXTERN) \
+	ocamlc -custom $(FLAGS) -o agg unix.cma bigarray.cma -I +threads threads.cma $(EXTERN) \
 	  str.cma swig.cmo bridge_wrap.o bridge.cmo syscalls.ml $(SOURCE) agg.ml
-	ocamlmktop -custom $(FLAGS) -o top $(EXTERN) \
+	ocamlmktop -custom $(FLAGS) -o top unix.cma bigarray.cma -I +threads threads.cma $(EXTERN) \
 	  str.cma swig.cmo bridge_wrap.o bridge.cmo syscalls.ml $(SOURCE)
 
 test: $(SOURCE) test.ml

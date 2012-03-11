@@ -676,19 +676,19 @@ START_WRAP(int, accept,(int s, struct sockaddr *addr, socklen_t *addrlen))
 void connect_event(int s, int r) {
 
   char ctmp[MAX_LOG_LINE+1];
-  struct sockaddr laddr, raddr;
+  struct sockaddr_storage laddr, raddr;
   char lhostport[1024], rhostport[1024];
-  unsigned int laddrlen = sizeof (struct sockaddr);
-  unsigned int raddrlen = sizeof (struct sockaddr);
+  unsigned int laddrlen = sizeof (laddr);
+  unsigned int raddrlen = sizeof (raddr);
 
   strcpy(lhostport, "other");
   strcpy(rhostport, "other");
 
-  if (getpeername(s, &raddr, &raddrlen) != -1)
-    parse_sockaddr(&raddr, raddrlen, rhostport, 1024);
+  if (getpeername(s, (struct sockaddr *)&raddr, &raddrlen) != -1)
+    parse_sockaddr((struct sockaddr *)&raddr, raddrlen, rhostport, 1024);
 
-  if (getsockname(s, &laddr, &laddrlen) != -1)
-    parse_sockaddr(&laddr, laddrlen, lhostport, 1024);
+  if (getsockname(s, (struct sockaddr *)&laddr, &laddrlen) != -1)
+    parse_sockaddr((struct sockaddr *)&laddr, laddrlen, lhostport, 1024);
 
   vfd_t *v = &vfd_tab[s];
   v->in_prog = 0;
